@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless data pipeline for the Olist dataset. A CSV file lands in S3,
+  EventBridge tells a Lambda, the Lambda starts a Glue job, the job writes
+  Parquet, and a crawler registers the tables so Athena can query them.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: olist-pipeline
+    AllowedPattern: "[a-z0-9-]+"
+    MaxLength: 30
+    Description: Prefix for the names of everything this stack creates.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 128
+
+Resources:
+  # ---------------------------------------------------------------- Storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 30
+
+  # ---------------------------------------------------------------- Trigger
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-the-glue-job
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: glue:StartJobRun
+                Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-incoming-to-processed"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-trigger:*"
+
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-trigger"
+      RetentionInDays: 30
+
+  TriggerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: TriggerLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-trigger"
+      CodeUri: src/trigger/
+      Handler: app.handler
+      Role: !GetAtt TriggerRole.Arn
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref GlueJob
+          LOG_LEVEL: INFO
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+      Events:
+        NewIncomingFile:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.s3]
+              detail-type: [Object Created]
+              detail:
+                bucket:
+                  name: [!Ref DataBucket]
+                object:
+                  key:
+                    - prefix: incoming/
+
+  # ------------------------------------------------------------------- Glue
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-incoming-write-processed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${DataBucket.Arn}/incoming/*"
+                  - !Sub "${DataBucket.Arn}/scripts/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${DataBucket.Arn}/processed/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-incoming-to-processed"
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      MaxRetries: 0
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucket}/scripts/incoming_to_processed.py"
+      DefaultArguments:
+        "--BUCKET": !Ref DataBucket
+        "--job-language": python
+        "--enable-continuous-cloudwatch-log": "true"
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: olist
+        Description: Tables written by the incoming-to-processed job
+
+  CrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-processed-update-catalog
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DataBucket.Arn}/processed/*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/olist"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/olist/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/crawlers*"
+
+  Crawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-processed"
+      Role: !GetAtt CrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucket}/processed/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # Run the crawler when the job finishes without errors.
+  CrawlAfterJob:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub "${ProjectName}-crawl-after-job"
+      Type: CONDITIONAL
+      StartOnCreation: true
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref GlueJob
+            State: SUCCEEDED
+      Actions:
+        - CrawlerName: !Ref Crawler
+
+  # ----------------------------------------------------------------- Athena
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref ProjectName
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  GlueJobName:
+    Value: !Ref GlueJob
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup

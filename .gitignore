@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# AWS SAM build output and local settings
+.aws-sam/
+samconfig.toml
+
+# Never commit keys or data
+.env
+*.pem
+*.csv
+*.parquet
+data/
